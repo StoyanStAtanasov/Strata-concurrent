@@ -3,6 +3,8 @@
 **Experimental Windows single-GPU concurrency fork:** [analysis, build instructions, and the 1/2/4/6 request sweep](docs/WINDOWS_CONCURRENCY.md).
 The GPU batching implementation comes from [upstream PR #559](https://github.com/Niko1221/Strata/pull/559).
 This fork adds server isolation fixes and Windows test tools. RTX 4090 performance is not yet measured.
+The [shared-prefix research and runnable CPU storage test](docs/SHARED_PREFIX.md) explore sharing a large project
+context between active agents. Shared-prefix inference is not implemented in this fork yet.
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
