@@ -1359,6 +1359,13 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::set_coupled_draft(o.coupled_draft);
+    if ((o.batch != 0 && (!o.serve || o.batch < 2 || o.batch > strata::kernels::kVerifyMaxT)) ||
+        o.batch_groups < 1 || (o.batch_groups > 1 &&
+        (o.batch == 0 || o.batch % o.batch_groups != 0 || o.layer_split.empty()))) {
+        std::fprintf(stderr, "strata generate: --batch requires --serve and 2..8 slots; --batch-groups must "
+                             "divide the slot count and needs a layer split\n");
+        return 2;
+    }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
@@ -5119,6 +5126,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        std::printf("INFO batch=%d batch_groups=%d\n", o.batch, o.batch_groups);
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -6337,7 +6345,9 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0;
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
-                    cont = false;
+                    std::printf("ERR batch admission failed: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    return 1;  // Never report a truncated successful answer after a failed state transfer.
                 }
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row

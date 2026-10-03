@@ -5,11 +5,13 @@ windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints 
   python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 4 --n 4 \
       --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
 """
-import argparse, json, os, subprocess, sys, threading, time
+import argparse, json, os, shlex, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import strata_tokenizer as ST  # noqa: E402
+from tools.concurrent_config import replace_option
 
 QUESTIONS = [
     "Explique en detail le fonctionnement d'un B-tree.",
@@ -40,17 +42,23 @@ class Engine:
         if len(cfg.get("gpu") or []) > 1:
             args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
         if batch:
-            args += ["--batch", str(batch)]
+            args = replace_option(args, "--batch", batch)
         args += extra_args
         env = dict(os.environ, **extra_env)
         env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
-        self.log = open("/tmp/batch_test_engine.log", "w")
+        if os.name == "nt":
+            env["PATH"] = os.pathsep.join(cfg.get("lib_dirs", []) + [env.get("PATH", "")])
+        if cfg.get("gpu") is not None:
+            gpu = cfg["gpu"]
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu)) if isinstance(gpu, list) else str(gpu)
+        self.log = tempfile.NamedTemporaryFile(mode="w", prefix="strata-batch-", suffix=".log", delete=False)
+        print(f"Engine log: {self.log.name}", flush=True)
         self.p = subprocess.Popen([exe, "--serve", *args], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1, env=env)
         for line in self.p.stdout:
             if line.startswith("READY"):
                 return
-        raise SystemExit("the engine ended before READY - see /tmp/batch_test_engine.log")
+        raise SystemExit("the engine ended before READY - see " + self.log.name)
 
     def send(self, line):
         self.p.stdin.write(line + "\n")
@@ -59,6 +67,18 @@ class Engine:
     def lines(self):
         for line in self.p.stdout:
             yield line.rstrip("\n")
+
+    def close(self):
+        if self.p.poll() is None:
+            try:
+                self.send("QUIT")
+                self.p.wait(timeout=180)
+            except (OSError, subprocess.TimeoutExpired):
+                self.p.kill()
+                self.p.wait(timeout=10)
+        self.p.stdin.close()
+        self.p.stdout.close()
+        self.log.close()
 
 
 def main():
@@ -71,13 +91,17 @@ def main():
     ap.add_argument("--skip-solo", action="store_true")
     ap.add_argument("--extra", default="", help='more engine arguments in one string, e.g. "--adapt-every 1000000"')
     a = ap.parse_args()
+    if not 2 <= a.batch <= 8 or not 1 <= a.n <= a.batch or a.max_new < 1:
+        ap.error("batch 2..8, n 1..batch, and max-new >= 1 required")
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
     prompts = []
     for q in QUESTIONS[: a.n]:
         text = f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         prompts.append(tok.encode(text, parse_special=True))
-    eng = Engine(a.exe, cfg, a.batch, {"STRATA_IQ_MT_MIN": "1", "STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}, a.extra.split())
+    eng = Engine(a.exe, cfg, a.batch, {"STRATA_IQ_MT_MIN": "1", "STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}, shlex.split(a.extra, posix=os.name != "nt"))
+    import atexit
+    atexit.register(eng.close)
     out = eng.lines()
 
     solo = []
@@ -88,9 +112,15 @@ def main():
             for line in out:
                 if line.startswith("T "):
                     got.append(int(line.split()[1]))
-                elif line.startswith("DONE") or line.startswith("ERR"):
+                elif line.startswith("ERR"):
+                    print(f"solo {i}: {line}", flush=True)
+                    return 1
+                elif line.startswith("DONE"):
                     print(f"solo {i}: {len(got)} tokens in {time.time() - t0:.1f}s  {line[:60]}", flush=True)
                     break
+            if not got:
+                print(f"solo {i}: no tokens; exactness comparison cannot pass", flush=True)
+                return 1
             solo.append(got)
 
     # batch: admit every prompt, then the slots decode together
@@ -117,7 +147,8 @@ def main():
                     done[i] = line
                 break
     t_admitted = time.time()
-    for line in out:
+    while len(done) < len(prompts):
+        line = next(out)
         if line.startswith("BT "):
             _, s, y = line.split()
             got[int(s)].append(int(y))
@@ -133,7 +164,7 @@ def main():
     total = sum(len(v) for v in got.values())
     print(f"batch: {len(prompts)} slots, {total} tokens; admissions {t_admitted - t_admit:.1f}s; "
           f"then {t_end - t_admitted:.1f}s -> aggregate {total / max(t_end - t_admit, 1e-9):.1f} tok/s overall, "
-          f"{sum(len(v) for v in got.values()) / max(t_end - (first_bt or t_admit), 1e-9):.1f} tok/s from the first batch token",
+          "(includes prompt admission; no sum of per-request rates)",
           flush=True)
     ok = True
     for i in range(len(prompts)):
@@ -144,8 +175,7 @@ def main():
             first_diff = next((k for k in range(min(len(b), len(solo[i]))) if b[k] != solo[i][k]), None)
             print(f"slot {i}: {len(b)} tokens, solo {len(solo[i])}: {'IDENTICAL' if same else f'DIFFERS at {first_diff}'}")
         print("   ", repr(tok.decode(b)[:160]))
-    eng.send("QUIT")
-    eng.p.wait(timeout=180)   # the next run needs the GPUs back
+    eng.close()
     return 0 if ok else 2
 
 

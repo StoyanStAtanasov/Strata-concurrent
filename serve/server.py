@@ -315,9 +315,23 @@ class StrataEngine:
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
 
+    @property
+    def last(self):
+        local = getattr(self, "request_local", None)
+        return getattr(local, "last", getattr(self, "_last", {}))
+
+    @last.setter
+    def last(self, value):
+        self._last = value
+        local = getattr(self, "request_local", None)
+        if local is not None and hasattr(local, "last"):
+            local.last = value
+
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
+        self.request_local = threading.local()
+        self.batch = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -377,6 +391,15 @@ class StrataEngine:
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
+        if self.batch and self.info.get("batch") != self.batch:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+            self.proc.stdin.close()
+            self.proc.stdout.close()
+            if log:
+                self.log.close()
+            raise RuntimeError("this engine does not report the requested batch slots; build this fork's engine "
+                               "with START-HERE.bat --build before using --batch")
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
@@ -400,6 +423,7 @@ class StrataEngine:
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         for line in proc.stdout:
+            self.last_output_at = time.monotonic()
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -546,10 +570,16 @@ class StrataEngine:
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE)."""
         stopped = False
+        heard = time.monotonic()
+        # The existing single-request watchdog's allowance for the next slow prompt chunk.
+        silence = float(self.silence_s or 0)
+        allowance = silence + PP_CHUNK_MAX / PP_FLOOR_TOK_S
         while True:
             try:
                 line = self.lines.get(timeout=10.0)
             except queue.Empty:
+                if silence > 0 and time.monotonic() - heard > allowance:
+                    raise self._silent("the batch admission stopped producing progress")
                 if cancel.is_set() and not stopped:
                     self._send("STOP")
                     stopped = True
@@ -557,6 +587,7 @@ class StrataEngine:
                 continue
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            heard = time.monotonic()
             if not line.startswith(("PP ", "INFO")):
                 btrace("ctl<", self._ctl_mode, line.strip()[:60])
             if line.startswith("T "):
@@ -609,13 +640,18 @@ class StrataEngine:
             pass
         def wait():
             end = time.monotonic() + 600.0
+            acknowledged = False
             while time.monotonic() < end:
                 try:
                     line = self.slot_q[slot].get(timeout=5.0)
                 except queue.Empty:
                     continue
                 if line is None or line.startswith("BDONE "):
+                    acknowledged = True
                     break
+            if not acknowledged:
+                # Reusing a slot without BDONE lets its old tokens reach the next request.
+                self._silent("the engine did not acknowledge BSTOP; the abandoned slot cannot be reused")
             with self.slot_cv:
                 self.slot_busy[slot] = False
                 self.slot_cv.notify_all()
@@ -628,17 +664,36 @@ class StrataEngine:
         slot's own BT lines until BDONE.  Several requests run at once; the control lines (prompt reading, admission)
         are taken one request at a time.  A consumer that stops early leaves the engine in step: the solo request is
         STOPped and read to its DONE, an admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
+        if cancel.is_set():
+            return
+        if embeddings:
+            raise ValueError("batch serving currently supports text requests only")
+        if (sampling or {}).get("strata_tune"):
+            raise ValueError("per-request engine tuning is not supported while batch slots share the engine")
+        for key, neutral in (("repeat_penalty", 1), ("repetition_penalty", 1), ("frequency_penalty", 0), ("presence_penalty", 0),
+                             ("penalty_repeat", 1), ("penalty_freq", 0), ("penalty_present", 0)):
+            if (sampling or {}).get(key, neutral) not in (None, neutral):
+                raise ValueError(f"{key} is not supported in batch serving; it would otherwise be ignored")
         self.progress = None
         keys = self.sampling_keys(sampling or {})
+        if getattr(self, "request_local", None) is not None:
+            self.request_local.last = {}
+        if self.info.get("cvec") and (sampling or {}).get("experimental_speed_projection") is False:
+            raise ValueError("per-request projection switching is not supported while batch slots share weights")
         out: list[int] = []
         pending: list[int] = []
         with self.slot_cv:
             self.waiting += 1
         try:
-            while not self.ctl.acquire(timeout=10.0):
+            heartbeat = time.monotonic()
+            while not self.ctl.acquire(timeout=0.1):
                 if cancel.is_set():
                     return
-                yield None
+                if not self.alive():
+                    raise EngineDied("the engine stopped while waiting for admission")
+                if time.monotonic() - heartbeat >= 10.0:
+                    heartbeat = time.monotonic()
+                    yield None
         finally:
             with self.slot_cv:
                 self.waiting -= 1
@@ -647,7 +702,10 @@ class StrataEngine:
         slot = None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
+        solo_last = None
         try:
+            if cancel.is_set():
+                return
             with self.slot_cv:
                 alone = not any(self.slot_busy) and self.waiting == 0
             prompt, left = list(ids), int(max_new)
@@ -676,16 +734,24 @@ class StrataEngine:
                 if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
                     return
                 prompt = list(ids) + out                # promoted: it continues in a batch slot from here
+                solo_last = dict(self.last)
             # a free slot (they free themselves at BDONE, which needs no control lines)
-            with self.slot_cv:
-                while True:
+            while True:
+                with self.slot_cv:
                     slot = next((b for b in self.slot_order if not self.slot_busy[b]), None)
                     if slot is not None:
                         self.slot_busy[slot] = True
                         break
-                    self.slot_cv.wait(timeout=10.0)
-                    if cancel.is_set():
-                        return
+                    self.slot_cv.wait(timeout=0.1)
+                if cancel.is_set():
+                    return
+                if not self.alive():
+                    raise EngineDied("the engine stopped while waiting for a batch slot")
+                if time.monotonic() - heartbeat >= 10.0:
+                    heartbeat = time.monotonic()
+                    yield None
+            if cancel.is_set():
+                return
             while not self.slot_q[slot].empty():
                 self.slot_q[slot].get_nowait()
             head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
@@ -709,6 +775,10 @@ class StrataEngine:
                 try:
                     line = self.slot_q[slot].get(timeout=10.0)
                 except queue.Empty:
+                    silence = float(self.silence_s or 0)
+                    if silence > 0 and time.monotonic() - getattr(self, "last_output_at", time.monotonic()) > \
+                            silence + PP_CHUNK_MAX / PP_FLOOR_TOK_S:
+                        raise self._silent("the batch engine stopped producing progress")
                     if cancel.is_set() and not stop_sent:
                         self._send(f"BSTOP {slot}")
                         stop_sent = True
@@ -728,7 +798,11 @@ class StrataEngine:
                     phase = "none"
                     f = line.split()
                     if len(f) >= 5 and isinstance(self.last, dict):
-                        self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4])}
+                        admitted = dict(self.last)
+                        base = solo_last or admitted
+                        self.last = {**base, "generated": len(out) + int(f[2]), "finish": f[3],
+                                     "decode_ms": (solo_last or {}).get("decode_ms", 0.0) +
+                                                  admitted.get("decode_ms", 0.0) + float(f[4])}
                     return
         finally:
             # a consumer that left early (or an error): keep the engine and this server in step
@@ -736,9 +810,12 @@ class StrataEngine:
             try:
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE")
+                    if self._drain_control("DONE") is None:
+                        raise self._silent("the stopped solo request was not acknowledged")
                 elif phase == "admit":
                     line = self._drain_control("BADM")
+                    if line is None:
+                        raise self._silent("the abandoned batch admission was not acknowledged")
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
             except EngineDied:
@@ -1201,6 +1278,34 @@ class Detokenizer:
 
 
 class Service:
+    @property
+    def status(self):
+        local = getattr(self, "run_local", None)
+        if local is not None and hasattr(local, "status"):
+            return local.status
+        active = list(getattr(self, "active_runs", {}).values())
+        if not active:
+            return self._status
+        busy = [s for s, _ in active if s.get("busy")]
+        result = dict(busy[0] if busy else self._status)
+        result.update(busy=bool(busy), active=len(busy), queued=sum(s.get("queued", 0) for s, _ in active),
+                      generated=sum(s.get("generated", 0) for s in busy))
+        first = [s["first_token"] for s in busy if s.get("first_token")]
+        result["first_token"] = min(first) if first else None
+        return result
+
+    @status.setter
+    def status(self, value):
+        self._status = value
+
+    @property
+    def rate(self):
+        return getattr(getattr(self, "run_local", None), "rate", self._rate)
+
+    @rate.setter
+    def rate(self, value):
+        self._rate = value
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
@@ -1211,6 +1316,8 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
+        self.run_local = threading.local()
+        self.active_runs = {}
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -1317,6 +1424,8 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if self.active_runs and not (len(self.active_runs) == 1 and hasattr(self.run_local, "status")):
+            raise EngineStarting("the failed engine can restart once its outstanding requests have ended")
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
@@ -1462,6 +1571,19 @@ class Service:
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating."""
         with self.status_lock:
+            if self.active_runs and not hasattr(self.run_local, "status"):
+                now = time.time()
+                total = 0.0
+                for state, samples in self.active_runs.values():
+                    if not state.get("busy") or not state.get("first_token"):
+                        continue
+                    rate = list(samples)
+                    old = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
+                    if rate and old and rate[-1][0] - old[0] >= RATE_MIN_SPAN_S:
+                        total += max(0, (rate[-1][1] - old[1]) / (rate[-1][0] - old[0]))
+                    else:
+                        total += state["generated"] / max(RATE_MIN_SPAN_S, now - state["first_token"])
+                return total
             s = dict(self.status)
             rate = list(self.rate)
         if not s.get("busy") or not s.get("first_token"):
@@ -1578,10 +1700,12 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            "concurrency": {"serving": 1, "requested": 1},       # one request at a time; more wait their turn
+            "concurrency": {"serving": getattr(self.engine, "batch", 0) or 1,
+                            "requested": getattr(self.engine, "batch", 0) or 1},
             "dialects": ["/v1/chat/completions", "/v1/messages"],
             "vision": {"enabled": images, "available": images, "error": None},
-            "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
+            "activity": {"requests": totals["requests"] + s.get("active", int(busy)),
+                         "in_flight": s.get("active", int(busy)) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
             "machine": {
@@ -1600,6 +1724,8 @@ class Service:
         self.embeddings.path = None
         images = images_of(messages)
         if images:
+            if getattr(self.engine, "batch", 0):
+                raise ValueError("batch serving currently supports text requests only")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -1686,6 +1812,27 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
+        if not getattr(self.engine, "batch", 0):
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel)
+            return
+        token = object()
+        self.run_local.status = {"busy": False, "queued": 0}
+        self.run_local.rate = collections.deque(maxlen=32)
+        local = getattr(self.engine, "request_local", None)
+        if local is not None:
+            local.last = {}
+        with self.status_lock:
+            self.active_runs[token] = (self.run_local.status, self.run_local.rate)
+        try:
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel)
+        finally:
+            with self.status_lock:
+                self.active_runs.pop(token, None)
+            del self.run_local.status, self.run_local.rate
+            if local is not None and hasattr(local, "last"):
+                del local.last
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -1714,7 +1861,10 @@ class Service:
                             trace["state"] = "generating"
                         self.status["queued"] -= 1
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
-                    self.ensure_loaded()
+                    with (self.fifo if getattr(self.engine, "batch", 0) else contextlib.nullcontext()):
+                        if not self.loaded() and len(self.active_runs) > 1:
+                            raise EngineDied("the engine stopped; waiting requests must finish before it restarts")
+                        self.ensure_loaded()
                     with self.status_lock:
                         self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                            generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -2468,8 +2618,12 @@ def make_handler(svc: Service):
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
                     with svc.status_lock:
                         busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                    count = getattr(svc.engine, "batch", 0) or 1
+                    flags = getattr(svc.engine, "slot_busy", [])
+                    slots = [{"id": i, "n_ctx": svc.engine.max_context,
+                              "is_processing": (flags[i] if i < len(flags) else False) or (i == 0 and busy)}
+                             for i in range(count)]
+                    self._json(200, slots if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -2584,7 +2738,8 @@ def make_handler(svc: Service):
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
             params["n_predict"] = svc.shared.get("max_tokens", -1)
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
-                     "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
+                     "total_slots": getattr(svc.engine, "batch", 0) or 1,
+                     "model_alias": svc.model, "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):

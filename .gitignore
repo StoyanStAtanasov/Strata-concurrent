@@ -14,6 +14,9 @@ pack/
 logs/
 __pycache__/
 .pytest_cache/
+.test-deps/
+concurrency-results/
+*.concurrent.json
 *.pyc
 
 # plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
